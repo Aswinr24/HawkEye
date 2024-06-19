@@ -44,9 +44,6 @@ app_access_limit = {
     "MicrosoftEdge.exe": 5,
     "chrome.exe": 5,
     "Notepad.exe":2,
-
-
-
 }
 
 
