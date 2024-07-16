@@ -11,16 +11,19 @@ import csv
 import cv2
 import threading
 import random
+import joblib
+import pandas as pd
 load_dotenv()
 
 
 url = os.environ.get("SUPABASE_URL")
 key = os.environ.get("SUPABASE_KEY")
 
+last_active_application=None
+
 
 supabase = create_client(url, key)
-#role='Developer'
-role='Marketing'
+role='Developer'
 
 
 role_app_access = {
@@ -29,7 +32,6 @@ role_app_access = {
     "Finance": ["excel.exe", "sheets.exe", "quickbooks.exe"],
     "Marketing": ["photoshop.exe", "illustrator.exe", "figma.exe", "chrome.exe","explorer.exe"],
 }
-
 
 app_access_limit = {
     "pycharm64.exe": 20,
@@ -46,6 +48,8 @@ app_access_limit = {
     "Notepad.exe":2,
 }
 
+
+pipeline=joblib.load('pipeline.pkl')
 
 violations = {}
 user_name = getpass.getuser()
@@ -92,102 +96,100 @@ def get_active_window():
         pid = win32process.GetWindowThreadProcessId(hwnd)
         process = psutil.Process(pid[-1])
         app_name = process.name()
+        if app_name.lower() in ['searchhost.exe']:
+            return None
+        if app_name.lower() in ['explorer.exe', 'applicationframehost.exe']:
+            window_text = win32gui.GetWindowText(hwnd)
+            return window_text
         return app_name
     except Exception as e:
         return None
-
-
-def log_violations(app, duration):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S (%A)")
-    count = violations[app]
-    supabase.table("violations").insert(
-        {"user_name": user_name, "application": app, "violation_count": count, "timestamp": timestamp, "role": role, "duration": duration}
+    
+def trigger_critical_alert(user_input):
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M")  
+    supabase.table("Alerts").insert(
+        {"alert": f'The application {user_input["application"]} has been accessed {user_input["access_count"]} times by {user_name}', "user_name":user_name}
     ).execute()
+    capture_photo()
+    print(f"Alert: The application {user_input["application"]} has been accessed {user_input["access_count"]} times by {user_name} at {current_time}!")
+
+
+def log_violations(user_input):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    supabase.table("violations").insert(
+        {"user_name": user_input['user_name'], "application": user_input["application"], "violation_count": user_input["access_count"], "timestamp": timestamp, "role": role, "duration": user_input["duration"]}
+    ).execute()
+    return
 
 
 def log_application_usage():
-    last_app = None
+    global last_active_application
     app_access_count = {}
     start_time = None
     no_action_start_time = None
-
-    csv_file = "application_usage_log.csv"
     user_name = getpass.getuser()
 
+    while True:
+        current_app = get_active_window()
+        current_time = time.time()
+        if current_app:
+            if current_app != last_active_application:
+                last_active_application = current_app
+                if last_active_application is not None and start_time is not None:
+                    duration_minutes = (current_time - start_time) / 60
+                    duration_minutes = round(duration_minutes, 2)
+                else:
+                    duration_minutes = 0  # Initial application or very short duration
 
-    file_exists = os.path.isfile(csv_file)
+                start_time = current_time
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")  # Format timestamp
 
-    with open(csv_file, mode='a', newline='') as file:
-        writer = csv.writer(file)
-        if not file_exists:
-            writer.writerow(["Timestamp", "Application", "User", "Duration (minutes)", "Access Count"])  # Updated header
+                if current_app in app_access_count:
+                    app_access_count[current_app] += 1
+                else:
+                    app_access_count[current_app] = 1
 
-        while True:
-            current_app = get_active_window()
-            current_time = time.time()
-            if current_app:
-                if current_app != last_app:
-                    if last_app is not None and start_time is not None:
-                        # Calculate the duration the last app was active
-                        duration_minutes = (current_time - start_time) / 60
-                        duration_minutes = round(duration_minutes, 2)
-                    else:
-                        duration_minutes = 0  # Initial application or very short duration
+                print(f"Debug: {current_app} - Access Count: {app_access_count[current_app]}, Access Limit: {app_access_limit.get(current_app, 'No limit set')}")
+                
+                user_role = supabase.table("user_analysis").select("role").filter("user_name", "eq", user_name).execute().data[0]["role"]
 
-                    # Update the start time for the new application
-                    start_time = current_time
-                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S (%A)")  # Format timestamp
+                three_hours_ago = time.time() - 3 * 60 * 60
+                if start_time >= three_hours_ago:
 
-                    # Update the access count for the current application
-                    if current_app in app_access_count:
-                        app_access_count[current_app] += 1
-                    else:
-                        app_access_count[current_app] = 1
+                    supabase.table("user_analysis").insert(
+                        {"log_time": timestamp, "application": current_app, "user_name": user_name, "duration": duration_minutes, "access_count": app_access_count[current_app],"role":role}
+                    ).execute()
+                    print(timestamp, current_app, user_name, f"{duration_minutes} minutes", f"Access Count: {app_access_count[current_app]}")
+                no_action_start_time = None
+                return {"id":[1],"log_time": [timestamp], "application": [current_app], "user_name": [user_name], "duration": [duration_minutes], "access_count": [app_access_count[current_app]], "role": [role]}
+        else:
 
-
-                    print(f"Debug: {current_app} - Access Count: {app_access_count[current_app]}, Access Limit: {app_access_limit.get(current_app, 'No limit set')}")
-
-
-                    if current_app in app_access_limit and app_access_count[current_app] > app_access_limit[current_app]:
-                        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")  # Get the current time
-                        # code to Db
-
-                        supabase.table("Alerts").insert(
-                            {"alert": f'The application {current_app} has been accessed more than {app_access_limit[current_app]} Times used by {user_name}', "user_name":user_name}
-                        ).execute()
-                        capture_photo()
-                        print(f"Alert: The application {current_app} has been accessed more than {app_access_limit[current_app]} times at {current_time}!")
-
-
-                    user_role = supabase.table("user_analysis").select("role").filter("user_name", "eq", user_name).execute().data[0]["role"]
-                    if user_role not in role_app_access or current_app not in role_app_access[user_role]:
-
-                        if current_app in violations:
-                            violations[current_app] += 1
-                        else:
-                            violations[current_app] = 1
-                        print(f"Violation: {user_name} accessed {current_app} which is not allowed for their role {user_role}. Total violations for this app: {violations[current_app]}")
-                        log_violations(current_app, duration_minutes)
-
-                    three_hours_ago = time.time() - 3 * 60 * 60
-                    if start_time >= three_hours_ago:
-                        writer.writerow([timestamp, current_app, user_name, duration_minutes, app_access_count[current_app]])
-
-                        supabase.table("user_analysis").insert(
-                            {"log_time": timestamp, "application": current_app, "user_name": user_name, "duration": duration_minutes, "access_count": app_access_count[current_app],"role":role}
-                        ).execute()
-                        print(timestamp, current_app, user_name, f"{duration_minutes} minutes", f"Access Count: {app_access_count[current_app]}")
-                    last_app = current_app
-                    no_action_start_time = None
+            if no_action_start_time is None:
+                no_action_start_time = current_time
             else:
 
-                if no_action_start_time is None:
-                    no_action_start_time = current_time
-                else:
+                if current_time - no_action_start_time >= 60:
+                    print("Alert: No process has been in action for 1 minute!")
+        time.sleep(1) 
 
-                    if current_time - no_action_start_time >= 60:
-                        print("Alert: No process has been in action for 1 minute!")
-            time.sleep(1)  # Check every second
+def process_log_data():
+  global last_active_application
+  while True:  
+    user_input = log_application_usage()  
+    input_df = pd.DataFrame(user_input)
+    print(input_df)
+    input_df['log_time'] = pd.to_datetime(input_df['log_time'])
+    input_df['hour'] = input_df['log_time'].dt.hour
+    input_df['day_of_week'] = input_df['log_time'].dt.dayofweek
+    input_df.drop(['log_time', 'id', 'user_name'], axis=1, inplace=True)
+    
+    print(input_df.shape)
+    prediction = pipeline.predict(input_df)
+    print(f'Predicted Label: {prediction[0]}')
+    if prediction[0] == 1:
+        log_violations(user_input)  
+    elif prediction[0] == 2:
+        trigger_critical_alert(user_input)  
 
 if __name__ == "__main__":
-    log_application_usage()
+    process_log_data()
